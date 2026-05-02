@@ -13,17 +13,32 @@ def parse_args():
 
 def main():
     args = parse_args()
+
     spark = (
         SparkSession.builder
         .appName("HeartRateAlertBatchAnalysis")
         .getOrCreate()
     )
 
-    # TODO: Implement:
-    #  - read JSON alerts from args.input_path
-    #  - group by patient_id and alert_type, count alerts
-    #  - maybe compute time-based stats
-    #  - write results to args.output_path in parquet or csv
+    alerts = spark.read.json(args.input_path)
+
+    alert_stats = (
+        alerts
+        .groupBy("patient_id", "alert_type")
+        .agg(
+            F.count("*").alias("alert_count"),
+            F.round(F.avg("avg_hr"), 2).alias("mean_window_avg_hr"),
+            F.min("min_hr").alias("lowest_observed_hr"),
+            F.max("max_hr").alias("highest_observed_hr"),
+            F.min("window_start").alias("first_window_start"),
+            F.max("window_end").alias("last_window_end"),
+        )
+        .orderBy("patient_id", "alert_type")
+    )
+
+    alert_stats.show(truncate=False)
+
+    alert_stats.write.mode("overwrite").parquet(args.output_path)
 
     spark.stop()
 
