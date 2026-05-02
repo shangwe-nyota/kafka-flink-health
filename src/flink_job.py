@@ -1,13 +1,16 @@
 import json
 from datetime import datetime
 from typing import Any, Dict
+from pyflink.datastream.functions import ProcessWindowFunction
+from pyflink.datastream.window import TumblingEventTimeWindows
+from pyflink.common.watermark_strategy import TimestampAssigner
 
 from pyflink.datastream import (
     StreamExecutionEnvironment,
     TimeCharacteristic,
-    Time,
 )
 from pyflink.common import Types, WatermarkStrategy, Duration
+from pyflink.common.time import Time
 from pyflink.datastream.connectors.kafka import (
     KafkaSource,
     KafkaSink,
@@ -29,7 +32,36 @@ def parse_event(value: str) -> Dict[str, Any]:
 
     TODO: implement parsing & validation logic.
     """
-    raise NotImplementedError("parse_event() is not implemented yet")
+    try:
+        obj = json.loads(value)
+
+        # check required fields
+        if "patient_id" not in obj or "timestamp" not in obj or "heart_rate_bpm" not in obj:
+            return None
+
+        patient_id = obj["patient_id"]
+        timestamp = obj["timestamp"]
+        heart_rate_bpm = obj["heart_rate_bpm"]
+
+        # validate types
+        if not isinstance(patient_id, str):
+            return None
+        if not isinstance(heart_rate_bpm, int):
+            return None
+
+        # parse timestamp → epoch millis
+        timestamp = timestamp.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(timestamp)
+        event_time = int(dt.timestamp() * 1000)
+
+        return {
+            "patient_id": patient_id,
+            "heart_rate_bpm": heart_rate_bpm,
+            "event_time": event_time,
+        }
+
+    except Exception:
+        return None
 
 
 def classify_window(avg_hr: float) -> str:
@@ -43,8 +75,12 @@ def classify_window(avg_hr: float) -> str:
       - avg_hr < 50  -> "bradycardia"
       - else -> "normal"
     """
-    raise NotImplementedError("classify_window() is not implemented yet")
-
+    if avg_hr > 100:
+        return "tachycardia"
+    elif avg_hr < 50:
+        return "bradycardia"
+    else:
+        return "normal"
 
 def build_env() -> StreamExecutionEnvironment:
     """
@@ -57,8 +93,34 @@ def build_env() -> StreamExecutionEnvironment:
     env.set_stream_time_characteristic(TimeCharacteristic.EventTime)
     env.enable_checkpointing(5000)  # 5s, can be tuned
     return env
+class EventTimeAssigner(TimestampAssigner):
+    def extract_timestamp(self, value, record_timestamp):
+        return int(value["event_time"])
 
+class HeartRateWindowFunction(ProcessWindowFunction):
+    def process(self, key, context, elements):
+        readings = list(elements)
 
+        if not readings:
+            return
+
+        heart_rates = [int(e["heart_rate_bpm"]) for e in readings]
+
+        avg_hr = sum(heart_rates) / len(heart_rates)
+        min_hr = min(heart_rates)
+        max_hr = max(heart_rates)
+
+        alert = {
+            "patient_id": key,
+            "window_start": context.window().start,
+            "window_end": context.window().end,
+            "avg_hr": round(avg_hr, 2),
+            "min_hr": min_hr,
+            "max_hr": max_hr,
+            "alert_type": classify_window(avg_hr),
+        }
+
+        yield json.dumps(alert)
 def main():
     env = build_env()
 
@@ -72,59 +134,33 @@ def main():
         .build()
     )
 
-    watermark_strategy = (
-        WatermarkStrategy.for_bounded_out_of_orderness(Duration.of_seconds(5))
-        .with_timestamp_assigner(
-            lambda event, ts: int(
-                # TODO: extract event-time from parsed event
-                # You may want to return epoch millis here
-                0
-            )
-        )
-    )
-
-    # Ingest raw strings
+    # Ingest raw strings first. We assign event-time after parsing because
+    # the raw Kafka value is still just a JSON string at this point.
     ds = env.from_source(
         source,
-        watermark_strategy,
+        WatermarkStrategy.no_watermarks(),
         "heart_rate_events_source",
     )
 
     # Parse events
     parsed = ds.map(
         lambda s: parse_event(s),
-        output_type=Types.MAP(Types.STRING(), Types.STRING()),
+        output_type=Types.MAP(Types.STRING(), Types.PICKLED_BYTE_ARRAY()),
     )
 
-    # TODO: You may want to filter out invalid records here, e.g.:
-    # parsed = parsed.filter(lambda e: e is not None)
+    # Filter out invalid records
+    parsed = parsed.filter(lambda e: e is not None)
 
-    # TODO: Assign timestamps/watermarks based on parsed event-time if you didn't do it earlier.
-
-    # Key by patient_id and apply windowed aggregation.
-    # For example: 1-minute tumbling or sliding windows computing avg/min/max.
-    #
-    # Hints:
-    #   - Use key_by(...) with patient_id.
-    #   - Use timeWindow or window with a Time window.
-    #   - Use an aggregate or reduce function to compute avg/min/max.
-    #   - Use classify_window on the aggregated result.
-    #
-    # The final output should be a JSON string with fields like:
-    #   {
-    #     "patient_id": "...",
-    #     "window_start": "...",
-    #     "window_end": "...",
-    #     "avg_hr": 87.2,
-    #     "min_hr": 60,
-    #     "max_hr": 120,
-    #     "alert_type": "tachycardia" / "bradycardia" / "normal"
-    #   }
-
-    # placeholder, to be replaced by student code
-    alerts_stream = parsed.map(
-        lambda e: json.dumps({"todo": "implement windowed aggregation"}),
-        output_type=Types.STRING(),
+    # Assign timestamps/watermarks based on parsed event-time.
+    watermarked = parsed.assign_timestamps_and_watermarks(
+        WatermarkStrategy.for_bounded_out_of_orderness(Duration.of_seconds(5))
+        .with_timestamp_assigner(EventTimeAssigner())
+    )
+    alerts_stream = (
+        watermarked
+        .key_by(lambda e: e["patient_id"])
+        .window(TumblingEventTimeWindows.of(Time.minutes(1)))
+        .process(HeartRateWindowFunction(), output_type=Types.STRING())
     )
 
     # Kafka sink for alerts
