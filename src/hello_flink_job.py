@@ -1,7 +1,7 @@
 import json
 
 from pyflink.datastream import StreamExecutionEnvironment
-from pyflink.common import Types
+from pyflink.common import Types, WatermarkStrategy
 from pyflink.common.serialization import SimpleStringSchema
 from pyflink.datastream.connectors.kafka import (
     KafkaSource,
@@ -34,7 +34,8 @@ def main():
     #   raw JSON string -> dict -> add field -> JSON string
     raw_stream = env.from_source(
         source,
-        watermark_strategy=None,
+        # PyFlink expects an explicit watermark strategy here on this local setup.
+        watermark_strategy=WatermarkStrategy.no_watermarks(),
         source_name="hello_input_source",
     )
 
